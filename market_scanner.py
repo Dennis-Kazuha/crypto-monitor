@@ -4,192 +4,295 @@ import numpy as np
 import time
 from datetime import datetime
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Optional
+import threading
 
 class SmartMarketScanner:
+    """市場掃描器 - 支持無 API Key 查詢公開數據"""
+    
+    FEE_SCHEDULE = {
+        'binance': {'maker': 0.0002, 'taker': 0.0005},
+        'bybit': {'maker': 0.0001, 'taker': 0.0006},
+        'okx': {'maker': 0.0002, 'taker': 0.0005}
+    }
+    
     def __init__(self, use_mock=False):
         self.use_mock = use_mock
         self.exchanges = {}
-        self.history = {} # 用來存歷史費率計算波動率
-
+        self.history = {}
+        self.cache = {}
+        self.cache_lock = threading.Lock()
+        
         if not use_mock:
-            # 初始化三大交易所
-            # 即使沒有 Key，ccxt 也能抓取公開報價 (Public Data)
-            # 但填入 Key 可以獲得更高的 API 頻率限制
-            try:
-                self.exchanges['binance'] = ccxt.binance({
-                    'apiKey': os.getenv('BINANCE_API_KEY'),
-                    'secret': os.getenv('BINANCE_SECRET'),
-                    'options': {'defaultType': 'future'}
-                })
-                
-                self.exchanges['bybit'] = ccxt.bybit({
-                    'apiKey': os.getenv('BYBIT_API_KEY'),
-                    'secret': os.getenv('BYBIT_SECRET'),
-                    'options': {'defaultType': 'linear'} # Bybit USDT合約通常是 linear
-                })
-                
-                self.exchanges['okx'] = ccxt.okx({
-                    'apiKey': os.getenv('OKX_API_KEY'),
-                    'secret': os.getenv('OKX_SECRET'),
-                    'password': os.getenv('OKX_PASSWORD'), # 修正：加入 Password
-                    'options': {'defaultType': 'swap'}
-                })
-                print("✅ 交易所連線初始化完成 (Real Mode)")
-            except Exception as e:
-                print(f"⚠️ 交易所初始化部分失敗: {e}")
-
-    def get_top_volume_symbols(self, limit=20):
-        """
-        [智能篩選] 只看流動性最好的前 20 大幣種
-        """
-        if self.use_mock:
-            return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
-            
+            self._initialize_exchanges()
+    
+    def _initialize_exchanges(self):
+        """初始化交易所（無需 API Key）"""
         try:
-            # 以 Binance 的交易量為基準
-            tickers = self.exchanges['binance'].fetch_tickers()
-            # 排序並過濾出 USDT 永續合約
-            sorted_tickers = sorted(
-                [t for t in tickers.values() if '/USDT' in t['symbol'] and 'BUS' not in t['symbol']], 
-                key=lambda x: x['quoteVolume'] if x['quoteVolume'] else 0, 
-                reverse=True
-            )
-            top_symbols = [t['symbol'] for t in sorted_tickers[:limit]]
-            return top_symbols
+            # Binance
+            self.exchanges['binance'] = ccxt.binance({
+                'enableRateLimit': True,
+                'options': {'defaultType': 'future'},
+                'timeout': 30000
+            })
+            
+            # Bybit
+            self.exchanges['bybit'] = ccxt.bybit({
+                'enableRateLimit': True,
+                'options': {'defaultType': 'linear'},
+                'timeout': 30000
+            })
+            
+            # OKX
+            self.exchanges['okx'] = ccxt.okx({
+                'enableRateLimit': True,
+                'options': {'defaultType': 'swap'},
+                'timeout': 30000
+            })
+            
+            print(f"✅ 初始化 {len(self.exchanges)} 個交易所")
         except Exception as e:
-            print(f"⚠️ 獲取熱門幣種失敗 (可能 API 受限): {e}")
-            return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'DOGE/USDT', 'ADA/USDT']
+            print(f"❌ 初始化失敗: {e}")
+    
+    def get_top_volume_symbols(self, limit=30) -> List[str]:
+        """獲取高交易量幣種 (已修復符號過濾問題)"""
+        cache_key = 'top_symbols'
+        
+        if cache_key in self.cache:
+            cached_time, cached_data = self.cache[cache_key]
+            if time.time() - cached_time < 300:
+                return cached_data
+        
+        if self.use_mock:
+            return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
+        
+        try:
+            # 確保至少有初始化 Binance (作為篩選基準)
+            if 'binance' not in self.exchanges:
+                return ['BTC/USDT', 'ETH/USDT']
+            
+            # 抓取所有 Ticker
+            tickers = self.exchanges['binance'].fetch_tickers()
+            
+            # [關鍵修正] 
+            # 1. 允許符號中包含 :USDT (因為合約通常長這樣 BTC/USDT:USDT)
+            # 2. 確保是 USDT 結算的合約
+            valid_tickers = []
+            for symbol, t in tickers.items():
+                # 過濾掉非 USDT、BUSD 對、以及沒有成交量的
+                if '/USDT' not in symbol: continue
+                if 'BUSD' in symbol: continue
+                if t.get('quoteVolume', 0) <= 0: continue
+                
+                valid_tickers.append(t)
+            
+            # 依成交量排序
+            sorted_tickers = sorted(valid_tickers, key=lambda x: x['quoteVolume'], reverse=True)
+            
+            # 取出符號，並做簡單清洗 (把 :USDT 拿掉以便跨交易所比對)
+            # 例如 BTC/USDT:USDT -> BTC/USDT
+            result = []
+            for t in sorted_tickers[:limit]:
+                clean_symbol = t['symbol'].split(':')[0] 
+                result.append(clean_symbol)
+            
+            # 寫入緩存
+            with self.cache_lock:
+                self.cache[cache_key] = (time.time(), result)
+            
+            return result
 
-    def scan_funding_opportunities(self):
-        """
-        [策略核心] 掃描全市場，尋找「長期穩定」且「高報酬」的機會
-        包含：資金費率(APR)、價差(Spread)、深度(Depth)
-        """
+        except Exception as e:
+            print(f"獲取幣種失敗: {e}")
+            # 發生錯誤時的回退機制
+            return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
+      
+    
+    def _fetch_orderbook_price(self, exchange_name: str, symbol: str, side: str) -> Optional[Dict]:
+        """獲取盤口價格"""
+        try:
+            exchange = self.exchanges[exchange_name]
+            
+            query_symbol = symbol
+            if exchange_name == 'okx':
+                query_symbol = f"{symbol.split('/')[0]}-USDT-SWAP"
+            
+            orderbook = exchange.fetch_order_book(query_symbol, limit=5)
+            
+            if side == 'long':
+                if orderbook['asks']:
+                    price = orderbook['asks'][0][0]
+                    depth = sum([ask[0] * ask[1] for ask in orderbook['asks'][:5]])
+                else:
+                    return None
+            else:
+                if orderbook['bids']:
+                    price = orderbook['bids'][0][0]
+                    depth = sum([bid[0] * bid[1] for bid in orderbook['bids'][:5]])
+                else:
+                    return None
+            
+            return {'price': price, 'depth': depth}
+        except Exception as e:
+            return None
+    
+    def _fetch_funding_rate(self, exchange_name: str, symbol: str) -> Optional[dict]:
+        """獲取資金費率"""
+        try:
+            exchange = self.exchanges[exchange_name]
+            
+            query_symbol = symbol
+            if exchange_name == 'okx':
+                query_symbol = f"{symbol.split('/')[0]}-USDT-SWAP"
+            
+            rate_info = exchange.fetch_funding_rate(query_symbol)
+            funding_rate = float(rate_info['fundingRate'])
+            
+            interval_hours = 8
+            if 'fundingIntervalHours' in rate_info:
+                interval_hours = rate_info['fundingIntervalHours']
+            
+            return {
+                'rate': funding_rate,
+                'interval_hours': int(interval_hours)
+            }
+        except Exception as e:
+            return None
+    
+    def _calculate_fees(self, long_ex: str, short_ex: str) -> float:
+        """計算手續費"""
+        long_fee = self.FEE_SCHEDULE.get(long_ex, {'maker': 0.0002, 'taker': 0.0005})
+        short_fee = self.FEE_SCHEDULE.get(short_ex, {'maker': 0.0002, 'taker': 0.0005})
+        
+        return long_fee['taker'] + short_fee['taker'] + long_fee['maker'] + short_fee['maker']
+    
+    def scan_funding_opportunities(self) -> List[Dict]:
+        """掃描套利機會"""
         if self.use_mock:
             return self._generate_mock_opportunities()
-
+        
+        if not self.exchanges:
+            print("❌ 沒有交易所連接")
+            return []
+        
+        print(f"\n🔍 開始掃描...")
         symbols = self.get_top_volume_symbols()
+        print(f"📊 掃描 {len(symbols)} 個幣種")
+        
         opportunities = []
-
-        # print(f"🔍 正在掃描 {len(symbols)} 個主流幣種的資金費率...")
-
-        for symbol in symbols:
-            rates = {}
-            # 1. 抓取各交易所資金費率
-            for ex_name, exchange in self.exchanges.items():
+        
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(self._scan_single_symbol, symbol): symbol for symbol in symbols}
+            
+            for future in as_completed(futures):
+                symbol = futures[future]
                 try:
-                    # 處理 OKX 特殊符號格式 (BTC/USDT:USDT -> BTC-USDT-SWAP)
-                    market_symbol = symbol
-                    if ex_name == 'okx': 
-                        market_symbol = symbol.split(':')[0].replace('/', '-') + '-SWAP'
-                    
-                    rate_info = exchange.fetch_funding_rate(market_symbol)
-                    rates[ex_name] = float(rate_info['fundingRate'])
+                    result = future.result()
+                    if result:
+                        opportunities.append(result)
+                        print(f"✅ {symbol}: APR {result['apr']:.2f}%")
                 except Exception as e:
-                    # print(f"  ❌ {ex_name} 抓取費率失敗: {symbol}")
-                    continue
+                    print(f"❌ {symbol}: {e}")
+        
+        print(f"\n✅ 找到 {len(opportunities)} 個機會")
+        return sorted(opportunities, key=lambda x: x['apr'], reverse=True)
+    
+    def _scan_single_symbol(self, symbol: str) -> Optional[Dict]:
+        """掃描單個幣種"""
+        try:
+            # 1. 獲取資金費率
+            rates = {}
+            intervals = {}
             
-            if len(rates) < 2: continue
-
-            # 找出最大利差組合
+            for ex_name in self.exchanges.keys():
+                result = self._fetch_funding_rate(ex_name, symbol)
+                if result:
+                    rates[ex_name] = result['rate']
+                    intervals[ex_name] = result['interval_hours']
+            
+            if len(rates) < 2:
+                return None
+            
+            # 2. 找最高和最低費率
             sorted_rates = sorted(rates.items(), key=lambda x: x[1])
-            min_ex, min_rate = sorted_rates[0]  # 做多 (付最少/領最多)
-            max_ex, max_rate = sorted_rates[-1] # 做空 (領最多/付最少)
+            min_ex, min_rate = sorted_rates[0]
+            max_ex, max_rate = sorted_rates[-1]
             
-            diff = max_rate - min_rate
-            apr = diff * 3 * 365 * 100 # 簡單預估年化
-
-            # --- 計算價差與深度 (Spread & Depth) ---
-            try:
-                # 處理 Symbol 名稱差異
-                long_sym = symbol
-                if min_ex == 'okx': long_sym = symbol.split(':')[0].replace('/', '-') + '-SWAP'
-                
-                short_sym = symbol
-                if max_ex == 'okx': short_sym = symbol.split(':')[0].replace('/', '-') + '-SWAP'
-
-                # 抓取 Ticker (包含 Bid/Ask)
-                long_ticker = self.exchanges[min_ex].fetch_ticker(long_sym)
-                short_ticker = self.exchanges[max_ex].fetch_ticker(short_sym)
-
-                # 做多買入價 (Ask) vs 做空賣出價 (Bid)
-                long_price = long_ticker['ask']
-                short_price = short_ticker['bid']
-                
-                # 1. 計算價差 (Spread %)
-                # (買價 - 賣價) / 賣價。正數 = 成本(虧損)；負數 = 利潤(折價)
-                spread = (long_price - short_price) / short_price * 100
-                
-                # 2. 計算深度 (Depth USDT)
-                # 簡單估算：以最佳一檔的掛單量 * 價格
-                long_vol = long_ticker['askVolume'] if long_ticker.get('askVolume') else 0
-                short_vol = short_ticker['bidVolume'] if short_ticker.get('bidVolume') else 0
-                
-                min_depth = min(long_vol * long_price, short_vol * short_price)
-
-            except Exception as e:
-                # 抓不到價格時給預設值，避免程式崩潰
-                spread = 0.0
-                min_depth = 0.0
-            # ----------------------------------------------------
-
-            # 計算穩定度 (Sigma)
-            if symbol not in self.history: self.history[symbol] = []
-            self.history[symbol].append(diff)
-            if len(self.history[symbol]) > 50: self.history[symbol].pop(0)
-            sigma = np.std(self.history[symbol]) if len(self.history[symbol]) > 5 else 0.0001
+            rate_diff = max_rate - min_rate
             
-            # [篩選邏輯] APR > 1% 才顯示
-            if apr > 1: 
-                opportunities.append({
-                    'symbol': symbol,
-                    'long_ex': min_ex,
-                    'long_rate': min_rate,
-                    'short_ex': max_ex,
-                    'short_rate': max_rate,
-                    'apr': apr,
-                    'sigma': sigma,
-                    'spread_price': spread, 
-                    'depth': min_depth      
-                })
-
-        # 排序：APR 高的在前面
-        best_opps = sorted(opportunities, key=lambda x: x['apr'], reverse=True)
-        return best_opps
-
-    def _generate_mock_opportunities(self):
-        """生成模擬數據"""
-        mock_symbols = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT', 'DOGE/USDT', 'AVAX/USDT']
-        exchanges = ['binance', 'bybit', 'okx']
-        opps = []
-        for symbol in mock_symbols:
-            long_ex = np.random.choice(exchanges)
-            short_ex = np.random.choice([e for e in exchanges if e != long_ex])
+            # 3. 計算 APR
+            funding_interval = min(intervals.get(min_ex, 8), intervals.get(max_ex, 8))
+            times_per_day = 24 / funding_interval
+            apr = rate_diff * times_per_day * 365 * 100
             
-            # 模擬隨機費率
-            long_rate = np.random.uniform(-0.0005, 0.0001)
-            short_rate = np.random.uniform(0.0001, 0.0008)
-            diff = short_rate - long_rate
-            apr = diff * 3 * 365 * 100
+            # 4. 獲取盤口
+            long_book = self._fetch_orderbook_price(min_ex, symbol, 'long')
+            short_book = self._fetch_orderbook_price(max_ex, symbol, 'short')
             
-            opps.append({
+            if not long_book or not short_book:
+                return None
+            
+            long_price = long_book['price']
+            short_price = short_book['price']
+            
+            # 5. 計算成本
+            spread_cost = (long_price - short_price) / short_price if short_price > 0 else 0.01
+            fee_cost = self._calculate_fees(min_ex, max_ex)
+            total_cost = spread_cost + fee_cost
+            
+            # 6. 回本天數
+            daily_yield = rate_diff * times_per_day
+            
+            if total_cost <= 0:
+                breakeven_days = 0.0
+            elif daily_yield > 0.000001:
+                breakeven_days = total_cost / daily_yield
+            else:
+                breakeven_days = 999
+            
+            # 7. 深度
+            depth = min(long_book['depth'], short_book['depth'])
+            
+            return {
                 'symbol': symbol,
-                'long_ex': long_ex,
-                'long_rate': long_rate,
-                'short_ex': short_ex,
-                'short_rate': short_rate,
+                'long_ex': min_ex,
+                'short_ex': max_ex,
+                'long_price': long_price,
+                'short_price': short_price,
                 'apr': apr,
-                'sigma': np.random.uniform(0.00001, 0.0001),
-                'spread_price': np.random.uniform(-0.05, 0.15), # 模擬價差
-                'depth': np.random.uniform(10000, 2000000)      # 模擬深度
-            })
-        return sorted(opps, key=lambda x: x['apr'], reverse=True)
-
-    def backtest_strategy(self, symbol, days=30):
-        """
-        [回測模組] 模擬回測
-        """
-        np.random.seed(len(symbol))
-        roi = np.random.uniform(5, 20)
-        mdd = np.random.uniform(1, 5)
-        return roi, mdd
+                'rate_diff': rate_diff,
+                'funding_interval': funding_interval,
+                'times_per_day': times_per_day,
+                'spread': spread_cost * 100,
+                'fees': fee_cost * 100,
+                'total_cost': total_cost * 100,
+                'breakeven_days': breakeven_days,
+                'depth': depth,
+                'timestamp': datetime.now()
+            }
+        
+        except Exception as e:
+            return None
+    
+    def _generate_mock_opportunities(self) -> List[Dict]:
+        """模擬數據"""
+        return [
+            {
+                'symbol': 'BTC/USDT',
+                'long_ex': 'binance',
+                'short_ex': 'bybit',
+                'long_price': 42150.5,
+                'short_price': 42148.2,
+                'apr': 25.8,
+                'rate_diff': 0.0006,
+                'funding_interval': 8,
+                'times_per_day': 3,
+                'spread': 0.005,
+                'fees': 0.14,
+                'total_cost': 0.145,
+                'breakeven_days': 0.8,
+                'depth': 8500000,
+                'timestamp': datetime.now()
+            }
+        ]
